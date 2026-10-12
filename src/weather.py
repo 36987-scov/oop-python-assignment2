@@ -1,12 +1,18 @@
 """Reusable functions for fetching and parsing weather data."""
 
+import time
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+MET_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+MET_UNIT_SYMBOLS = {"celsius": "°C", "mm": "mm"}
 DEFAULT_TIMEOUT = 10
+MAX_RETRIES = 3          # retries after the first attempt (4 attempts in total)
+BACKOFF_SECONDS = 1.0    # first wait; doubles after each failed attempt
 MAX_FORECAST_DAYS = 16
 DAILY_VARIABLES = [
     "temperature_2m_max",
@@ -79,19 +85,46 @@ def parse_geocoding_results(data: dict) -> list[dict]:
     return candidates
 
 
+class WeatherAPIError(Exception):
+    """Raised when a weather API request fails and will not be retried."""
+
+
 def fetch_json(url: str, params: dict, user_agent: str,
-               timeout: float = DEFAULT_TIMEOUT) -> dict:
+               timeout: float = DEFAULT_TIMEOUT,
+               max_retries: int = MAX_RETRIES,
+               backoff: float = BACKOFF_SECONDS) -> dict:
     """Send a GET request and return the decoded JSON body.
 
+    Connection errors, timeouts and HTTP 5xx responses are retried up to
+    max_retries times, waiting backoff, 2*backoff, 4*backoff ... seconds
+    between attempts. HTTP 4xx responses are not retried, because the
+    request itself is wrong and repeating it cannot succeed.
+
     Raises:
-        requests.HTTPError: if the server returns a 4xx or 5xx status.
-        requests.RequestException: for connection problems or timeouts.
+        WeatherAPIError: on a 4xx response, or when all attempts fail.
     """
-    response = requests.get(url, params=params,
-                            headers={"User-Agent": user_agent},
-                            timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, params=params,
+                                    headers={"User-Agent": user_agent},
+                                    timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as error:
+            status = error.response.status_code
+            if status < 500:
+                raise WeatherAPIError(
+                    f"{url} returned HTTP {status}: {error.response.text[:200]}"
+                ) from error
+            last_error = error
+        except (requests.ConnectionError, requests.Timeout) as error:
+            last_error = error
+        if attempt < max_retries:
+            time.sleep(backoff * 2 ** attempt)
+    raise WeatherAPIError(
+        f"{url} failed after {max_retries + 1} attempts: {last_error}"
+    ) from last_error
 
 
 def geocode(name: str, user_agent: str, count: int = 5,
@@ -153,10 +186,7 @@ def get_forecast(lat: float, lon: float, days: int, user_agent: str,
     Raises:
         ValueError: if lat, lon or days are out of range.
     """
-    if not -90 <= lat <= 90:
-        raise ValueError(f"Latitude must be between -90 and 90, got {lat}.")
-    if not -180 <= lon <= 180:
-        raise ValueError(f"Longitude must be between -180 and 180, got {lon}.")
+    _check_coordinates(lat, lon)
     if not 1 <= days <= MAX_FORECAST_DAYS:
         raise ValueError(
             f"days must be between 1 and {MAX_FORECAST_DAYS}, got {days}."
@@ -304,3 +334,100 @@ def summarise_forecast(df: pd.DataFrame, place: str) -> str:
         f"- Most common conditions: {df['Weather'].mode()[0]}.",
     ]
     return "\n".join(lines)
+
+
+def _check_coordinates(lat: float, lon: float) -> None:
+    """Raise ValueError if lat or lon is outside the valid range."""
+    if not -90 <= lat <= 90:
+        raise ValueError(f"Latitude must be between -90 and 90, got {lat}.")
+    if not -180 <= lon <= 180:
+        raise ValueError(f"Longitude must be between -180 and 180, got {lon}.")
+
+
+def get_met_forecast(lat: float, lon: float, user_agent: str) -> dict:
+    """Request the MET Norway Locationforecast 2.0 compact forecast.
+
+    Coordinates are rounded to 4 decimals, as MET Norway's terms of
+    service require. The user_agent must identify the app and a contact.
+
+    Raises:
+        ValueError: if lat or lon is out of range.
+        WeatherAPIError: if the request fails (see fetch_json).
+    """
+    _check_coordinates(lat, lon)
+    params = {"lat": round(lat, 4), "lon": round(lon, 4)}
+    return fetch_json(MET_URL, params, user_agent)
+
+
+def met_to_daily_dataframe(data: dict, timezone: str) -> pd.DataFrame:
+    """Aggregate a MET Norway compact forecast into local daily values.
+
+    MET timestamps are UTC; they are converted to the location's time zone
+    before grouping, so each row covers one local calendar day. Precipitation
+    uses each step's next_1_hours amount where available, otherwise its
+    next_6_hours amount (later forecast days are only 6-hourly). Max/min
+    temperatures are taken from the instantaneous samples, so days with few
+    samples (shown in "Hourly samples") are less precise.
+
+    Args:
+        data: JSON returned by get_met_forecast.
+        timezone: Time zone name, e.g. "Africa/Kampala".
+
+    Returns:
+        One row per local day: Date, max and min temperature,
+        precipitation and the number of samples used.
+    """
+    units = data["properties"]["meta"]["units"]
+    temp_unit = MET_UNIT_SYMBOLS.get(units["air_temperature"],
+                                     units["air_temperature"])
+    rain_unit = MET_UNIT_SYMBOLS.get(units["precipitation_amount"],
+                                     units["precipitation_amount"])
+
+    rows = []
+    for step in data["properties"]["timeseries"]:
+        step_data = step["data"]
+        precipitation = None
+        for period in ("next_1_hours", "next_6_hours"):
+            if period in step_data:
+                precipitation = step_data[period]["details"].get(
+                    "precipitation_amount")
+                break
+        rows.append({
+            "time": step["time"],
+            "temperature": step_data["instant"]["details"]["air_temperature"],
+            "precipitation": precipitation,
+        })
+
+    hourly = pd.DataFrame(rows)
+    local_time = pd.to_datetime(hourly["time"], utc=True).dt.tz_convert(timezone)
+    hourly["Date"] = local_time.dt.tz_localize(None).dt.normalize()
+
+    daily = hourly.groupby("Date").agg(
+        max_temp=("temperature", "max"),
+        min_temp=("temperature", "min"),
+        precipitation=("precipitation", "sum"),
+        samples=("temperature", "size"),
+    ).reset_index()
+    return daily.rename(columns={
+        "max_temp": f"Max temperature ({temp_unit})",
+        "min_temp": f"Min temperature ({temp_unit})",
+        "precipitation": f"Precipitation ({rain_unit})",
+        "samples": "Hourly samples",
+    })
+
+
+def compare_forecasts(open_meteo: pd.DataFrame, met: pd.DataFrame) -> pd.DataFrame:
+    """Join two daily forecasts on Date and add Open-Meteo minus MET differences.
+
+    Only columns present in both DataFrames (same name, same unit) are
+    compared, so values in different units are never subtracted.
+    """
+    shared = [c for c in met.columns if c in open_meteo.columns and c != "Date"]
+    merged = open_meteo[["Date", *shared]].merge(
+        met[["Date", *shared]], on="Date",
+        suffixes=(" [Open-Meteo]", " [MET]"))
+    for column in shared:
+        merged[f"{column} difference"] = (
+            merged[f"{column} [Open-Meteo]"] - merged[f"{column} [MET]"]
+        ).round(1)
+    return merged
