@@ -87,4 +87,4 @@ Results below are from the run on 12 October 2026; live forecasts change on each
 
 
 ### AI assistance: 
-I used AI to assist with explanations and debugging of code. The resulting implementation was tested, and the project author reviewed the code and its outputs.
+I used AI to assist with explanations and debugging of code. The resulting implementation was tested, and the outputs of the code reviewed.
