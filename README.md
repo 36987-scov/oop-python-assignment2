@@ -82,3 +82,9 @@ Results below are from the run on 12 October 2026; live forecasts change on each
 - A payroll example (UGX 1,000,000 gross) shows the deduction order at work: PAYE is UGX 2,250 lower in October than November because the LST instalment is deducted before PAYE.
 - The rental module reproduces URA's own worked example exactly (UGX 381,600).
 - `Decimal` avoids float errors such as `0.1 + 0.2 = 0.30000000000000004`.
+
+
+
+
+### AI assistance: 
+I used AI to assist with code generation, explanations, debugging and development of the project. The resulting implementation was tested, and the project author reviewed the code and its outputs.
