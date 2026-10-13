@@ -1,9 +1,10 @@
 """Uganda tax engine: money, errors, schedules and tax calculations."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from enum import Enum
 from functools import total_ordering
 
 CURRENCY = "UGX"
@@ -184,6 +185,8 @@ class TaxContext:
     allowances: Money = Money.zero()
     deductions: Money = Money.zero()
     resident: bool = True
+    revenue: Money = Money.zero()
+    invoices: tuple["Invoice", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -243,3 +246,187 @@ class PAYE(Tax):
         schedule = self.schedule_for(ctx.on, ctx.resident)
         tax = schedule.tax_on(chargeable).rounded()
         return TaxResult("PAYE", chargeable, tax, schedule.name)
+
+
+LST_MONTHS = (7, 8, 9, 10)   # July to October: first four months of the FY
+
+
+class NSSF(Tax):
+    """An NSSF contribution: a fixed share of monthly gross pay, uncapped.
+
+    One class serves both shares, with different rates (5% employee,
+    10% employer). Assumption, following the brief: the base is gross pay,
+    excluding allowances.
+    """
+
+    def __init__(self, rate: Decimal, name: str) -> None:
+        self.rate = rate
+        self.name = name
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return the contribution on ctx.gross_pay, rounded to shillings."""
+        _require_non_negative("Gross pay", ctx.gross_pay)
+        return TaxResult(self.name, ctx.gross_pay,
+                         (ctx.gross_pay * self.rate).rounded(),
+                         f"{self.rate:.0%} of gross pay")
+
+
+class LocalServiceTax(Tax):
+    """Local Service Tax, collected in four equal monthly instalments.
+
+    The annual amount is configurable, because LST bands are set by local
+    government and differ by salary band. An instalment of a quarter of the
+    annual amount is due in July, August, September and October only.
+    """
+
+    def __init__(self, annual_amount: Money) -> None:
+        _require_non_negative("Annual LST", annual_amount)
+        self.annual_amount = annual_amount
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return this month's LST instalment (zero outside July-October)."""
+        if ctx.on.month in LST_MONTHS:
+            instalment = (self.annual_amount * Decimal("0.25")).rounded()
+            return TaxResult("LST", self.annual_amount, instalment,
+                             "instalment, 1 of 4 (Jul-Oct)")
+        return TaxResult("LST", self.annual_amount, Money.zero(),
+                         "no instalment this month")
+
+
+@dataclass(frozen=True)
+class Payslip:
+    """One month's payroll result for one employee."""
+
+    gross_pay: Money
+    allowances: Money
+    nssf_employee: TaxResult
+    lst: TaxResult
+    paye: TaxResult
+    nssf_employer: TaxResult
+    net_pay: Money
+
+
+class PayrollPipeline:
+    """Monthly payroll: NSSF, then LST, then PAYE, then net pay.
+
+    Order of deductions:
+    1. NSSF is charged on gross pay and is not deductible for PAYE.
+    2. The LST instalment is deducted before PAYE, as it reduces the
+       income available for PAYE.
+    3. PAYE is charged on gross pay + allowances - LST.
+    4. Net pay = gross + allowances - employee NSSF - LST - PAYE.
+    The employer's NSSF share is an employer cost, not deducted from pay.
+    The pipeline is built from Tax objects (composition), so any part
+    can be replaced, for example with a different LST amount.
+    """
+
+    def __init__(self, lst_annual: Money = Money.zero(),
+                 paye: PAYE | None = None) -> None:
+        self.paye = paye or PAYE()
+        self.lst = LocalServiceTax(lst_annual)
+        self.nssf_employee = NSSF(Decimal("0.05"), "NSSF (employee)")
+        self.nssf_employer = NSSF(Decimal("0.10"), "NSSF (employer)")
+
+    def run(self, ctx: TaxContext) -> Payslip:
+        """Calculate one month's payslip for the given context."""
+        nssf_employee = self.nssf_employee.calculate(ctx)
+        nssf_employer = self.nssf_employer.calculate(ctx)
+        lst = self.lst.calculate(ctx)
+        paye = self.paye.calculate(
+            replace(ctx, deductions=ctx.deductions + lst.tax))
+        net = (ctx.gross_pay + ctx.allowances
+               - nssf_employee.tax - lst.tax - paye.tax)
+        return Payslip(ctx.gross_pay, ctx.allowances, nssf_employee, lst,
+                       paye, nssf_employer, net)
+
+
+VAT_STANDARD_RATE = Decimal("0.18")
+CORPORATION_TAX_RATE = Decimal("0.30")
+
+
+class SupplyType(Enum):
+    """VAT category of a supply under the Uganda VAT Act."""
+
+    STANDARD = "standard-rated"
+    ZERO_RATED = "zero-rated"
+    EXEMPT = "exempt"
+
+
+@dataclass(frozen=True)
+class Invoice:
+    """A VAT-exclusive invoice amount, either a sale or a purchase.
+
+    for_exempt_use marks a purchase used to make exempt supplies; its
+    input VAT cannot be credited.
+    """
+
+    amount: Money
+    supply: SupplyType
+    is_sale: bool
+    for_exempt_use: bool = False
+
+    def __post_init__(self) -> None:
+        _require_non_negative("Invoice amount", self.amount)
+
+
+class VAT(Tax):
+    """Value Added Tax: output VAT on sales minus creditable input VAT.
+
+    Standard-rated supplies carry 18%, zero-rated 0%, and exempt supplies
+    are outside VAT. A negative result is a refund or credit due.
+    Simplification: no apportionment for mixed taxable/exempt businesses.
+    """
+
+    def __init__(self, standard_rate: Decimal = VAT_STANDARD_RATE) -> None:
+        self.rates = {SupplyType.STANDARD: standard_rate,
+                      SupplyType.ZERO_RATED: Decimal("0"),
+                      SupplyType.EXEMPT: Decimal("0")}
+
+    def _vat_on(self, invoice: Invoice) -> Money:
+        return invoice.amount * self.rates[invoice.supply]
+
+    def output_vat(self, invoices: tuple[Invoice, ...]) -> Money:
+        """Return VAT charged on sales, rounded to whole shillings."""
+        total = Money.zero()
+        for invoice in invoices:
+            if invoice.is_sale:
+                total = total + self._vat_on(invoice)
+        return total.rounded()
+
+    def input_vat(self, invoices: tuple[Invoice, ...]) -> Money:
+        """Return creditable VAT paid on purchases, rounded to shillings."""
+        total = Money.zero()
+        for invoice in invoices:
+            if not invoice.is_sale and not invoice.for_exempt_use:
+                total = total + self._vat_on(invoice)
+        return total.rounded()
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return net VAT payable (negative means a refund or credit)."""
+        output = self.output_vat(ctx.invoices)
+        credit = self.input_vat(ctx.invoices)
+        taxable_sales = Money.zero()
+        for invoice in ctx.invoices:
+            if invoice.is_sale and invoice.supply is not SupplyType.EXEMPT:
+                taxable_sales = taxable_sales + invoice.amount
+        return TaxResult("VAT", taxable_sales, output - credit,
+                         f"output {output}, input {credit}")
+
+
+class CorporateIncomeTax(Tax):
+    """Corporate income tax on chargeable income (revenue - deductions).
+
+    A loss gives zero tax; carrying losses forward is not modelled.
+    """
+
+    def __init__(self, rate: Decimal = CORPORATION_TAX_RATE) -> None:
+        self.rate = rate
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return corporate income tax due, rounded to whole shillings."""
+        _require_non_negative("Revenue", ctx.revenue)
+        _require_non_negative("Deductions", ctx.deductions)
+        chargeable = max(ctx.revenue - ctx.deductions, Money.zero())
+        return TaxResult("Corporate income tax", chargeable,
+                         (chargeable * self.rate).rounded(),
+                         f"{self.rate:.0%} of chargeable income")        
