@@ -430,3 +430,90 @@ class CorporateIncomeTax(Tax):
         return TaxResult("Corporate income tax", chargeable,
                          (chargeable * self.rate).rounded(),
                          f"{self.rate:.0%} of chargeable income")        
+
+
+URA_WHT_PAGE = ("URA withholding tax page, https://ura.go.ug/en/witholding-tax/ "
+                "(accessed 13 October 2026)")
+URA_RENTAL_PAGE = ("URA rental income tax page, https://ura.go.ug/en/rental-income-tax-4/ "
+                   "(accessed 13 October 2026)")
+
+DESIGNATED_AGENT_THRESHOLD = Money(1_000_000)
+RENTAL_THRESHOLD_INDIVIDUAL = Money(2_820_000)   # check the 2026 Amendment Act
+RENTAL_RATE_INDIVIDUAL = Decimal("0.12")
+RENTAL_RATE_COMPANY = Decimal("0.30")
+RENTAL_EXPENSE_CAP_COMPANY = Decimal("0.50")
+
+
+class PaymentType(Enum):
+    """Payments covered by the withholding tax module."""
+
+    PROFESSIONAL_FEES = "professional, management or agency fees"
+    GOODS_AND_SERVICES = "goods and services from a designated agent"
+    INTEREST = "interest"
+    DIVIDENDS = "dividends"
+
+
+# (payment type, payee is resident) -> rate. Source: URA_WHT_PAGE.
+WHT_RATES = {
+    (PaymentType.PROFESSIONAL_FEES, True): Decimal("0.06"),
+    (PaymentType.GOODS_AND_SERVICES, True): Decimal("0.06"),
+    (PaymentType.INTEREST, True): Decimal("0.15"),
+    (PaymentType.DIVIDENDS, True): Decimal("0.15"),
+    (PaymentType.PROFESSIONAL_FEES, False): Decimal("0.15"),
+    (PaymentType.GOODS_AND_SERVICES, False): Decimal("0.15"),
+    (PaymentType.INTEREST, False): Decimal("0.15"),
+    (PaymentType.DIVIDENDS, False): Decimal("0.15"),
+}
+
+
+class WithholdingTax(Tax):
+    """Withholding tax on one type of payment, at URA's standard rates.
+
+    ctx.revenue is the gross payment and ctx.resident is the payee's status.
+    Designated-agent goods and services are only taxed above UGX 1,000,000.
+    Out of scope: listed-company and treaty rates, exemption certificates,
+    and the 2026 rules for entertainers and foreign-debt interest.
+    """
+
+    def __init__(self, payment_type: PaymentType) -> None:
+        self.payment_type = payment_type
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return the tax to withhold from the gross payment."""
+        _require_non_negative("Payment", ctx.revenue)
+        rate = WHT_RATES[(self.payment_type, ctx.resident)]
+        if (self.payment_type is PaymentType.GOODS_AND_SERVICES
+                and not DESIGNATED_AGENT_THRESHOLD < ctx.revenue):
+            return TaxResult("Withholding tax", ctx.revenue, Money.zero(),
+                             "below the UGX 1,000,000 threshold")
+        return TaxResult("Withholding tax", ctx.revenue,
+                         (ctx.revenue * rate).rounded(),
+                         f"{rate:.0%} on {self.payment_type.value}")
+
+
+class RentalIncomeTax(Tax):
+    """Annual rental income tax for an individual or a non-individual.
+
+    Individuals: 12% of gross rent above UGX 2,820,000; no expenses allowed.
+    Companies, trustees and retirement schemes: expenses (ctx.deductions)
+    allowed up to 50% of gross rent; the rest taxed at 30%.
+    ctx.revenue is the annual gross rental income. Source: URA_RENTAL_PAGE.
+    """
+
+    def __init__(self, individual: bool = True) -> None:
+        self.individual = individual
+
+    def calculate(self, ctx: TaxContext) -> TaxResult:
+        """Return the annual rental income tax, rounded to whole shillings."""
+        _require_non_negative("Gross rental income", ctx.revenue)
+        _require_non_negative("Deductions", ctx.deductions)
+        gross = ctx.revenue
+        if self.individual:
+            chargeable = max(gross - RENTAL_THRESHOLD_INDIVIDUAL, Money.zero())
+            rate, note = RENTAL_RATE_INDIVIDUAL, "individual: threshold only"
+        else:
+            allowed = min(ctx.deductions, gross * RENTAL_EXPENSE_CAP_COMPANY)
+            chargeable = max(gross - allowed, Money.zero())
+            rate, note = RENTAL_RATE_COMPANY, "non-individual: expenses capped at 50%"
+        return TaxResult("Rental income tax", chargeable,
+                         (chargeable * rate).rounded(), note)
