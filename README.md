@@ -65,6 +65,16 @@ The brief allows urllib, requests, json, datetime, time, os, pandas and matplotl
 
 ## Summary of findings"
 
+### Mini-Project 1: Weather forecast with Python web APIs
+
+Results below are from the run on 12 October 2026; live forecasts change on each run.
+
+- **Geocoding and ambiguity:** searching "Mukono" returned five places worldwide, including a fuzzy match ("Mokono", DR Congo). With the Uganda filter, three candidates remained, including "Mukono Landing" from prefix matching; candidate 0 (population 191,300) is Mukono town, chosen with `LOCATION_CHOICE`.
+- **urllib vs requests:** both returned identical results. `requests` needed two steps instead of six and decodes the response using the declared charset, but does not raise on 4xx/5xx errors without `raise_for_status()`. Responses were `application/json; charset=utf-8`, typically in about 1 second.
+- **Forecast (12–18 October 2026, Africa/Kampala):** temperatures from 18.2 to 27.6 °C (warmest Wednesday 14 October); rain on all 7 days, 44.0 mm in total, heaviest on Friday 16 October (14.5 mm); a thunderstorm forecast on Thursday 15 October; strongest wind 16.8 km/h.
+- **Reliability:** an invalid request (HTTP 400) failed immediately without retries (0.8 s); a tiny timeout failed after 3 attempts in 1.5 s, matching the backoff waits; a simulated network failure took 13.7 s, mostly due to the operating system's handling of refused connections.
+- **Second source:** MET Norway agreed with Open-Meteo on daily maximum temperatures to within about 1.3 °C, but rainfall differed by up to 11.9 mm, reflecting model differences for tropical showers. MET's first day covered only the remaining night hours.
+- **Tests:** 8 offline pytest checks on saved API responses all pass.
 ### Mini-Project 2: Uganda tax engine
 
 - PAYE follows two dated resident schedules: FY 2025/26 (URA rates page) and, from 1 July 2026, the Income Tax (Amendment) Act 2026, which raised the nil band to UGX 335,000 and added a 25% band. Dates outside these years raise `NoScheduleForDateError` instead of guessing.
